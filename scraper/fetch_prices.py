@@ -1,0 +1,13 @@
+{
+  "updated_at": "17 Mar 2026",
+  "updated_time": "07:00 AM IST",
+  "market": "Kottayam",
+  "source": "Rubber Board, Govt. of India",
+  "source_url": "https://rubberboard.gov.in/public",
+  "prices": {
+    "rss4":    { "per_kg": 217.0,  "per_100kg": 21700.0, "change": "up",   "diff": 0.0 },
+    "rss5":    { "per_kg": 212.0,  "per_100kg": 21200.0, "change": "up",   "diff": 0.0 },
+    "isnr20":  { "per_kg": 186.0,  "per_100kg": 18600.0, "change": "down", "diff": 0.0 },
+    "latex60": { "per_kg": 151.1,  "per_100kg": 15110.0, "change": "up",   "diff": 0.0 }
+  }
+}
