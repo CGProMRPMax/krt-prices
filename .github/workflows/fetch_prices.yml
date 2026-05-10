@@ -1,0 +1,49 @@
+name: Fetch Rubber Prices Daily
+
+on:
+  schedule:
+    # 10:00 IST every day = 04:30 UTC
+    # Cron format: minute hour day month weekday
+    - cron: '30 4 * * *'
+  workflow_dispatch:  # manual run from Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Scrape Rubber Board
+        run: python fetch_prices.py
+
+      - name: Commit and push if prices changed
+        id: commit
+        run: |
+          git config user.name  "krt-prices-bot"
+          git config user.email "bot@kulathinal.com"
+          git add prices/prices.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            git commit -m "Auto-update rubber prices $(TZ='Asia/Kolkata' date +'%d %b %Y %H:%M IST')"
+            git push
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Purge jsDelivr cache so kulathinal.com sees fresh data
+        if: steps.commit.outputs.changed == 'true'
+        run: |
+          curl -fsSL "https://purge.jsdelivr.net/gh/CGProMRPMax/krt-prices@main/prices/prices.json" || echo "Purge failed (non-fatal)"
