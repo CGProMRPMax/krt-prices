@@ -1,284 +1,69 @@
-#!/usr/bin/env python3
-"""
-Kulathinal Rubber Estate Management - daily price scraper (Playwright, v3).
+name: Fetch Rubber Prices Daily
 
-Renders https://rubberboard.gov.in/public via headless Chromium, then parses
-the Domestic Market (Kottayam) price table after the JavaScript finishes
-populating it. The previous requests+BeautifulSoup approach stopped working
-once Rubber Board moved to JS-rendered tables.
+# Why 17:00 IST? Rubber Board publishes the daily Kottayam prices at 4 PM IST.
+# Running at 10 AM (the old schedule) always picked up yesterday's data.
+# Why minute :37? GitHub Actions queue is busiest on the hour / half-hour.
+# Off-peak minutes have better on-time delivery.
+on:
+  schedule:
+    - cron: '37 11 * * *'   # 11:37 UTC = 17:07 IST, daily
+  workflow_dispatch:        # manual run from Actions tab
 
-Schedule: daily 17:00 IST via GitHub Actions
-          (Rubber Board publishes the daily Kottayam prices at 4 PM IST).
+permissions:
+  contents: write
 
-v3 changes (11-May-2026):
-  - Switched from requests to Playwright (page is JS-rendered)
-  - Find the table by anchoring on the "Domestic Market on DD-MM-YYYY" heading
-    instead of "first table containing Kottayam+RSS" - the page has multiple
-    such tables (international markets) and the old logic took the wrong one
-  - Record source_date in the output JSON so the ticker can detect staleness
-  - On failure, dump screenshot + HTML to debug/ for offline inspection
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-Output: prices/prices.json - consumed by https://www.kulathinal.com
-"""
-import json
-import os
-import re
-import sys
-from datetime import datetime, timezone, timedelta
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-RUBBER_BOARD_URL = "https://rubberboard.gov.in/public"
-OUTPUT_FILE      = "prices/prices.json"
-DEBUG_DIR        = "debug"
-IST              = timezone(timedelta(hours=5, minutes=30))
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install playwright beautifulsoup4
 
-# Map of human grade labels (as they appear on rubberboard.gov.in) to our
-# JSON keys. The normalize() function strips spaces/parens/hyphens before
-# comparing, so "Latex (60%)" and "Latex60%" both match latex60.
-GRADES = {
-    "RSS4":       "rss4",
-    "RSS5":       "rss5",
-    "ISNR20":     "isnr20",
-    "Latex(60%)": "latex60",
-}
+      - name: Install Chromium for Playwright
+        run: playwright install --with-deps chromium
 
+      - name: Scrape Rubber Board (Playwright)
+        run: python fetch_prices.py
 
-def normalize(s):
-    """Strip whitespace, parens and hyphens; lowercase."""
-    return re.sub(r"[\s\(\)\-]", "", s or "").lower()
+      - name: Upload diagnostic dump on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rubber-scrape-failure-${{ github.run_id }}
+          path: debug/
+          retention-days: 7
+          if-no-files-found: ignore
 
+      - name: Commit and push if prices changed
+        id: commit
+        run: |
+          git config user.name  "krt-prices-bot"
+          git config user.email "bot@kulathinal.com"
+          git add prices/prices.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            git commit -m "Auto-update rubber prices $(TZ='Asia/Kolkata' date +'%d %b %Y %H:%M IST')"
+            git push
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
 
-# ---------------------------------------------------------------------------
-# Rendering
-# ---------------------------------------------------------------------------
-
-def render_page():
-    """
-    Launch headless Chromium, navigate to Rubber Board, wait for the
-    Domestic Market table to be filled in by JS, return rendered HTML.
-    Returns (html, debug_info) or (None, debug_info) on failure.
-    """
-    debug = {"title": None, "bytes": 0, "url": RUBBER_BOARD_URL}
-    html  = None
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 900},
-            locale="en-IN",
-        )
-        page = context.new_page()
-
-        try:
-            print(f"Navigating to {RUBBER_BOARD_URL}")
-            page.goto(RUBBER_BOARD_URL,
-                      wait_until="domcontentloaded", timeout=60000)
-
-            # The "Domestic Market on DD-MM-YYYY" heading appears as soon as
-            # the section renders. Wait for it explicitly.
-            print("Waiting for 'Domestic Market' heading...")
-            page.wait_for_selector(
-                "text=/Domestic\\s*Market.*per\\s*100Kg/i",
-                timeout=45000,
-            )
-
-            # The heading appears slightly before the rows are filled in some
-            # versions of their JS. Give it a moment.
-            page.wait_for_timeout(2500)
-
-            html           = page.content()
-            debug["title"] = page.title()
-            debug["bytes"] = len(html)
-            debug["url"]   = page.url
-            print(f"Rendered: title='{debug['title']}', "
-                  f"bytes={debug['bytes']}, final_url={debug['url']}")
-
-        except Exception as e:
-            print(f"ERROR: render failed: {type(e).__name__}: {e}",
-                  file=sys.stderr)
-            # Dump diagnostics so the Actions run can upload them as an artifact
-            try:
-                os.makedirs(DEBUG_DIR, exist_ok=True)
-                page.screenshot(
-                    path=f"{DEBUG_DIR}/last_failure.png",
-                    full_page=True,
-                )
-                with open(f"{DEBUG_DIR}/last_failure.html", "w",
-                          encoding="utf-8") as f:
-                    f.write(page.content() or "")
-                print(f"Diagnostic dump written to {DEBUG_DIR}/",
-                      file=sys.stderr)
-            except Exception as dump_err:
-                print(f"Could not capture diagnostic dump: {dump_err}",
-                      file=sys.stderr)
-            html = None
-        finally:
-            browser.close()
-
-    return html, debug
-
-
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
-
-HEADING_RE = re.compile(
-    r"Domestic\s*Market.*?on\s+(\d{2})-(\d{2})-(\d{4})",
-    re.IGNORECASE,
-)
-
-
-def parse_domestic_kottayam(html):
-    """
-    Locate the 'Domestic Market on DD-MM-YYYY' heading, then find the nearest
-    table containing RSS4 + RSS5 rows. Return (prices, source_date_iso).
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Find the heading and pull the source date out of its text.
-    source_date = None
-    heading_node = soup.find(string=HEADING_RE)
-    if heading_node:
-        m = HEADING_RE.search(heading_node)
-        if m:
-            dd, mm, yyyy = m.groups()
-            source_date  = f"{yyyy}-{mm}-{dd}"
-            print(f"Domestic Market heading date: {source_date}")
-    else:
-        print("WARN: 'Domestic Market on DD-MM-YYYY' heading not found",
-              file=sys.stderr)
-
-    # 2. From the heading, walk UP to a container that holds a <table>, then
-    #    search ONLY within that container. This avoids the international
-    #    market tables further down the page.
-    scope = soup
-    if heading_node:
-        anchor = heading_node.parent
-        for _ in range(8):
-            if anchor and anchor.find("table"):
-                scope = anchor
-                break
-            anchor = anchor.parent if anchor else None
-
-    # 3. Within scope, find the table whose rows start with RSS4 / RSS5.
-    found = {}
-    for table in scope.find_all("table"):
-        rows = table.find_all("tr")
-        first_cells = " ".join(
-            (tr.find(["td", "th"]).get_text(strip=True) if tr.find(["td", "th"]) else "")
-            for tr in rows
-        )
-        if "RSS4" not in first_cells or "RSS5" not in first_cells:
-            continue
-
-        for row in rows:
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
-                continue
-            label_norm = normalize(cells[0].get_text())
-            grade_key  = None
-            for grade_label, key in GRADES.items():
-                if normalize(grade_label) == label_norm:
-                    grade_key = key
-                    break
-            if grade_key is None:
-                continue
-            # Take the first numeric cell (INR column) - ignore the USD column.
-            for cell in cells[1:]:
-                raw = re.sub(r"[^\d.]", "", cell.get_text())
-                if raw and float(raw) > 100:
-                    found[grade_key] = float(raw)
-                    print(f"  {cells[0].get_text(strip=True)}: Rs.{raw}/100kg")
-                    break
-        break  # first valid table within the Domestic Market scope is enough
-
-    if not found:
-        print("ERROR: Domestic Market section located but no price rows parsed.",
-              file=sys.stderr)
-        return None, source_date
-
-    return found, source_date
-
-
-# ---------------------------------------------------------------------------
-# IO + main
-# ---------------------------------------------------------------------------
-
-def load_prev():
-    """Read the previous prices.json and return {key: per_100kg}."""
-    if os.path.exists(OUTPUT_FILE):
-        try:
-            with open(OUTPUT_FILE) as f:
-                d = json.load(f)
-            return {k: v.get("per_100kg", 0)
-                    for k, v in d.get("prices", {}).items()}
-        except Exception:
-            pass
-    return {}
-
-
-def main():
-    prev          = load_prev()
-    html, _debug  = render_page()
-
-    if not html:
-        print("ABORT: page render failed; previous prices.json kept untouched.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    prices, source_date = parse_domestic_kottayam(html)
-    if not prices:
-        print("ABORT: parse failed; previous prices.json kept untouched.",
-              file=sys.stderr)
-        sys.exit(1)
-
-    now_ist = datetime.now(IST)
-    grades  = {}
-    for k, v in prices.items():
-        p = prev.get(k, v)
-        grades[k] = {
-            "per_kg":    round(v / 100, 2),
-            "per_100kg": v,
-            "change":    "up" if v > p else "down" if v < p else "flat",
-            "diff":      round(abs(v - p), 1),
-        }
-
-    out = {
-        "updated_at":   now_ist.strftime("%d %b %Y"),
-        "updated_time": now_ist.strftime("%I:%M %p IST").lstrip("0"),
-        "market":       "Kottayam",
-        "source":       "Rubber Board, Govt. of India",
-        "source_url":   RUBBER_BOARD_URL,
-        "source_date":  source_date,
-        "prices":       grades,
-    }
-
-    # Skip rewrite if nothing changed (avoids noisy git history)
-    if os.path.exists(OUTPUT_FILE):
-        try:
-            with open(OUTPUT_FILE) as f:
-                existing = json.load(f)
-            if (existing.get("prices") == out["prices"]
-                    and existing.get("source_date") == out["source_date"]):
-                print("No price change since last run - skipping rewrite.")
-                return
-        except Exception:
-            pass
-
-    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(out, f, indent=2)
-    print(f"Done. Wrote {OUTPUT_FILE} at "
-          f"{out['updated_at']} {out['updated_time']} "
-          f"(source_date={source_date})")
-
-
-if __name__ == "__main__":
-    main()
+      - name: Purge jsDelivr cache so kulathinal.com sees fresh data
+        if: steps.commit.outputs.changed == 'true'
+        run: |
+          curl -fsSL "https://purge.jsdelivr.net/gh/CGProMRPMax/krt-prices@main/prices/prices.json" \
+            || echo "Purge failed (non-fatal)"
