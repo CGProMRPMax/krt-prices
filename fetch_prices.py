@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Kulathinal Rubber Estate Management — daily price scraper (v3).
-Scrapes RSS4, RSS5, ISNR20, Latex(60%) from the Kottayam market section.
-Output: prices/prices.json (consumed by https://www.kulathinal.com)
+Kulathinal Rubber Estate Management - daily price scraper (Playwright, v3).
 
-Run schedule: daily 10:00 IST via GitHub Actions.
+Renders https://rubberboard.gov.in/public via headless Chromium, then parses
+the Domestic Market (Kottayam) price table after the JavaScript finishes
+populating it. The previous requests+BeautifulSoup approach stopped working
+once Rubber Board moved to JS-rendered tables.
 
-v3 changes (10-May-2026):
-  - Switched source from rubberboard.gov.in/public to commoditymarketlive.com
-    Reason: rubberboard.gov.in went JS-rendered some time after our last
-    successful scrape (09-May), so requests-based scraping returns the page
-    shell with zero data tables. commoditymarketlive.com is server-rendered
-    HTML republishing the same Rubber Board, Kottayam market data — same
-    source-of-truth, ready to scrape.
-  - Parser now targets the "Kottayam Market" section heading and reads the
-    table beneath it.
-  - 'source' field still credits 'Rubber Board, Govt. of India' since
-    commoditymarketlive is a downstream republisher of Rubber Board data.
+Schedule: daily 17:00 IST via GitHub Actions
+          (Rubber Board publishes the daily Kottayam prices at 4 PM IST).
+
+v3 changes (11-May-2026):
+  - Switched from requests to Playwright (page is JS-rendered)
+  - Find the table by anchoring on the "Domestic Market on DD-MM-YYYY" heading
+    instead of "first table containing Kottayam+RSS" - the page has multiple
+    such tables (international markets) and the old logic took the wrong one
+  - Record source_date in the output JSON so the ticker can detect staleness
+  - On failure, dump screenshot + HTML to debug/ for offline inspection
+
+Output: prices/prices.json - consumed by https://www.kulathinal.com
 """
 import json
 import os
@@ -24,159 +26,190 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-DATA_URL    = "https://www.commoditymarketlive.com/rubber-price"
-OUTPUT_FILE = "prices/prices.json"
-IST         = timezone(timedelta(hours=5, minutes=30))
+RUBBER_BOARD_URL = "https://rubberboard.gov.in/public"
+OUTPUT_FILE      = "prices/prices.json"
+DEBUG_DIR        = "debug"
+IST              = timezone(timedelta(hours=5, minutes=30))
 
-# Map the labels appearing in the Kottayam table -> our JSON keys.
-# Labels come from <a> tags inside the Category cell, e.g. "RSS4", "Latex(60%)".
-GRADE_LABELS = {
+GRADES = {
     "RSS4":       "rss4",
     "RSS5":       "rss5",
     "ISNR20":     "isnr20",
     "Latex(60%)": "latex60",
 }
 
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
+
+def normalize(s):
+    return re.sub(r"[\s\(\)\-]", "", s or "").lower()
 
 
-def make_session():
-    sess = requests.Session()
-    sess.headers.update(BROWSER_HEADERS)
-    retry = Retry(
-        total=3,
-        backoff_factor=2,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
+def render_page():
+    debug = {"title": None, "bytes": 0, "url": RUBBER_BOARD_URL}
+    html  = None
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 900},
+            locale="en-IN",
+        )
+        page = context.new_page()
+
+        try:
+            print(f"Navigating to {RUBBER_BOARD_URL}")
+            page.goto(RUBBER_BOARD_URL,
+                      wait_until="domcontentloaded", timeout=60000)
+
+            print("Waiting for 'Domestic Market' heading...")
+            page.wait_for_selector(
+                "text=/Domestic\\s*Market.*per\\s*100Kg/i",
+                timeout=45000,
+            )
+            page.wait_for_timeout(2500)
+
+            html           = page.content()
+            debug["title"] = page.title()
+            debug["bytes"] = len(html)
+            debug["url"]   = page.url
+            print(f"Rendered: title='{debug['title']}', "
+                  f"bytes={debug['bytes']}, final_url={debug['url']}")
+
+        except Exception as e:
+            print(f"ERROR: render failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            try:
+                os.makedirs(DEBUG_DIR, exist_ok=True)
+                page.screenshot(
+                    path=f"{DEBUG_DIR}/last_failure.png",
+                    full_page=True,
+                )
+                with open(f"{DEBUG_DIR}/last_failure.html", "w",
+                          encoding="utf-8") as f:
+                    f.write(page.content() or "")
+                print(f"Diagnostic dump written to {DEBUG_DIR}/",
+                      file=sys.stderr)
+            except Exception as dump_err:
+                print(f"Could not capture diagnostic dump: {dump_err}",
+                      file=sys.stderr)
+            html = None
+        finally:
+            browser.close()
+
+    return html, debug
 
 
-def parse_money(s):
-    """'₹25,500.00' -> 25500.0. Returns None on parse failure."""
-    if not s:
-        return None
-    cleaned = re.sub(r"[^\d.]", "", s)
-    try:
-        return float(cleaned) if cleaned else None
-    except ValueError:
-        return None
+HEADING_RE = re.compile(
+    r"Domestic\s*Market.*?on\s+(\d{2})-(\d{2})-(\d{4})",
+    re.IGNORECASE,
+)
 
 
-def find_kottayam_table(soup):
-    """Locate the <table> that follows the 'Kottayam Market' heading."""
-    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
-        text = h.get_text(strip=True)
-        if "Kottayam" in text and "Market" in text:
-            tbl = h.find_next("table")
-            if tbl:
-                return tbl
-    return None
+def parse_domestic_kottayam(html):
+    soup = BeautifulSoup(html, "html.parser")
 
+    source_date  = None
+    heading_node = soup.find(string=HEADING_RE)
+    if heading_node:
+        m = HEADING_RE.search(heading_node)
+        if m:
+            dd, mm, yyyy = m.groups()
+            source_date  = f"{yyyy}-{mm}-{dd}"
+            print(f"Domestic Market heading date: {source_date}")
+    else:
+        print("WARN: 'Domestic Market on DD-MM-YYYY' heading not found",
+              file=sys.stderr)
 
-def fetch_prices():
-    """Returns ({grade_key: {'price', 'prev'}}, source_date) or (None, None)."""
-    sess = make_session()
-    try:
-        print(f"GET {DATA_URL}")
-        r = sess.get(DATA_URL, timeout=30, allow_redirects=True)
-        print(f"  status: {r.status_code}, bytes: {len(r.content)}")
-        r.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        print(f"ERROR: HTTP {e.response.status_code} from {DATA_URL}", file=sys.stderr)
-        print(f"  Response excerpt: {e.response.text[:400]}", file=sys.stderr)
-        return None, None
-    except Exception as e:
-        print(f"ERROR: scrape failed: {type(e).__name__}: {e}", file=sys.stderr)
-        return None, None
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = find_kottayam_table(soup)
-    if not table:
-        print("ERROR: could not locate Kottayam table on the page.", file=sys.stderr)
-        print(f"  HTML excerpt: {r.text[:600]}", file=sys.stderr)
-        return None, None
+    scope = soup
+    if heading_node:
+        anchor = heading_node.parent
+        for _ in range(8):
+            if anchor and anchor.find("table"):
+                scope = anchor
+                break
+            anchor = anchor.parent if anchor else None
 
     found = {}
-    source_date = None
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 4:                       # header / spacer row
-            continue
-        date_text  = cells[0].get_text(strip=True)
-        category   = cells[1].get_text(strip=True)   # 'RSS4', 'Latex(60%)' etc
-        price_text = cells[2].get_text(strip=True)   # '₹25,500.00'
-        prev_text  = cells[3].get_text(strip=True)   # '₹25,300.00'
-
-        if category not in GRADE_LABELS:
-            continue
-        price = parse_money(price_text)
-        prev  = parse_money(prev_text)
-        if price is None:
+    for table in scope.find_all("table"):
+        rows = table.find_all("tr")
+        first_cells = " ".join(
+            (tr.find(["td", "th"]).get_text(strip=True) if tr.find(["td", "th"]) else "")
+            for tr in rows
+        )
+        if "RSS4" not in first_cells or "RSS5" not in first_cells:
             continue
 
-        key = GRADE_LABELS[category]
-        found[key] = {"price": price, "prev": prev if prev is not None else price}
-        source_date = source_date or date_text
-        print(f"  {category}: Rs.{price}/100kg (prev Rs.{prev})")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            label_norm = normalize(cells[0].get_text())
+            grade_key  = None
+            for grade_label, key in GRADES.items():
+                if normalize(grade_label) == label_norm:
+                    grade_key = key
+                    break
+            if grade_key is None:
+                continue
+            for cell in cells[1:]:
+                raw = re.sub(r"[^\d.]", "", cell.get_text())
+                if raw and float(raw) > 100:
+                    found[grade_key] = float(raw)
+                    print(f"  {cells[0].get_text(strip=True)}: Rs.{raw}/100kg")
+                    break
+        break
 
     if not found:
-        print("ERROR: Kottayam table found but no rows matched our grades.", file=sys.stderr)
-        return None, None
+        print("ERROR: Domestic Market section located but no price rows parsed.",
+              file=sys.stderr)
+        return None, source_date
 
     return found, source_date
 
 
-def load_prev_per100():
-    """Return {key: per_100kg} from the previously-saved prices.json (for fallback diff)."""
+def load_prev():
     if os.path.exists(OUTPUT_FILE):
         try:
             with open(OUTPUT_FILE) as f:
                 d = json.load(f)
-                return {k: v.get("per_100kg", 0) for k, v in d.get("prices", {}).items()}
+            return {k: v.get("per_100kg", 0)
+                    for k, v in d.get("prices", {}).items()}
         except Exception:
             pass
     return {}
 
 
 def main():
-    historical = load_prev_per100()       # for change tracking if source has no prev_text
-    fetched, source_date = fetch_prices()
+    prev          = load_prev()
+    html, _debug  = render_page()
 
-    if not fetched:
-        print("ERROR: no prices scraped and refusing to write stale fallbacks.", file=sys.stderr)
-        if historical:
-            print("Previous prices on disk are kept untouched.", file=sys.stderr)
+    if not html:
+        print("ABORT: page render failed; previous prices.json kept untouched.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    prices, source_date = parse_domestic_kottayam(html)
+    if not prices:
+        print("ABORT: parse failed; previous prices.json kept untouched.",
+              file=sys.stderr)
         sys.exit(1)
 
     now_ist = datetime.now(IST)
-    grades = {}
-    for k, info in fetched.items():
-        cur  = info["price"]
-        # Prefer the upstream's "prev price" column. Fallback to our own last-saved.
-        prev = info["prev"] if info["prev"] != cur else historical.get(k, cur)
+    grades  = {}
+    for k, v in prices.items():
+        p = prev.get(k, v)
         grades[k] = {
-            "per_kg":    round(cur / 100, 2),
-            "per_100kg": cur,
-            "change":    "up" if cur > prev else "down" if cur < prev else "flat",
-            "diff":      round(abs(cur - prev), 1),
+            "per_kg":    round(v / 100, 2),
+            "per_100kg": v,
+            "change":    "up" if v > p else "down" if v < p else "flat",
+            "diff":      round(abs(v - p), 1),
         }
 
     out = {
@@ -184,8 +217,8 @@ def main():
         "updated_time": now_ist.strftime("%I:%M %p IST").lstrip("0"),
         "market":       "Kottayam",
         "source":       "Rubber Board, Govt. of India",
-        "source_url":   "https://rubberboard.gov.in/public",
-        "source_date":  source_date,            # YYYY-MM-DD from upstream
+        "source_url":   RUBBER_BOARD_URL,
+        "source_date":  source_date,
         "prices":       grades,
     }
 
@@ -193,8 +226,9 @@ def main():
         try:
             with open(OUTPUT_FILE) as f:
                 existing = json.load(f)
-            if existing.get("prices") == out["prices"]:
-                print("No price change since last run — skipping rewrite.")
+            if (existing.get("prices") == out["prices"]
+                    and existing.get("source_date") == out["source_date"]):
+                print("No price change since last run - skipping rewrite.")
                 return
         except Exception:
             pass
@@ -202,8 +236,9 @@ def main():
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     with open(OUTPUT_FILE, "w") as f:
         json.dump(out, f, indent=2)
-    print(f"Done. Wrote {OUTPUT_FILE} at {out['updated_at']} {out['updated_time']} "
-          f"(source date: {source_date})")
+    print(f"Done. Wrote {OUTPUT_FILE} at "
+          f"{out['updated_at']} {out['updated_time']} "
+          f"(source_date={source_date})")
 
 
 if __name__ == "__main__":
